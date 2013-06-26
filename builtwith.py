@@ -1,4 +1,5 @@
 import datetime
+import pytz
 import re
 import requests
 
@@ -14,20 +15,32 @@ class UnsupportedApiVersion(NotImplementedError):
     pass
 
 
-def _convert_string_to_datetime(datetime_string):
+def _convert_string_to_utc_datetime(datetime_string):
     return datetime.datetime.fromtimestamp(
-        int(re.search("\d+", datetime_string).group(0)) / 1000)
+        int(re.search("\d+", datetime_string).group(0)) / 1000, pytz.UTC)
+
+
+def _convert_string_to_date(date_string):
+    return datetime.datetime.strptime(date_string, "%Y-%m-%d").date()
 
 
 class UrlTechnologiesSet(object):
 
-    def __init__(self, technologies_list):
+    def __init__(self, technologies_list, last_full_builtwith_scan):
         DATETIME_INFORMATION_NAMES = ["FirstDetected", "LastDetected"]
 
         self._technologies_by_name = {}
         for technologies_dict in technologies_list:
             for name in DATETIME_INFORMATION_NAMES:
-                technologies_dict[name] = _convert_string_to_datetime(technologies_dict[name])
+                technologies_dict[name] = _convert_string_to_utc_datetime(technologies_dict[name])
+
+            # According to the team at BuiltWith, it's best to just use the last "FULL" scan
+            # time in the CurrentlyLive determination since BuiltWith doesn't publish their
+            # smaller "TOPSITE" list. Downside is that this client will say some technologies were
+            # successfully detected on "TOPSITE" sites on the the last BuiltWith scan when that's
+            # not in fact accurate.
+            technologies_dict['CurrentlyLive'] = (
+                last_full_builtwith_scan <= technologies_dict['LastDetected'].date())
 
             self._technologies_by_name[technologies_dict['Name']] = technologies_dict
 
@@ -43,14 +56,14 @@ class UrlTechnologiesSet(object):
 
 class BuiltWithDomainInfo(object):
 
-    def __init__(self, api_response_json):
+    def __init__(self, api_response_json, last_full_builtwith_scan):
         self.api_response_json = api_response_json
         self._technologies_by_url = {}
         for path_entry in api_response_json['Paths']:
             url_key = self.__get_url_key(
                 path_entry['Domain'], path_entry.get('SubDomain', None), path_entry['Url'])
             self._technologies_by_url[
-                url_key] = UrlTechnologiesSet(path_entry['Technologies'])
+                url_key] = UrlTechnologiesSet(path_entry['Technologies'], last_full_builtwith_scan)
 
     def __iter__(self):
         return iter(self._technologies_by_url.values())
@@ -94,11 +107,16 @@ class BuiltWith(object):
         """
         Lookup BuiltWith results for the given domain.
         """
+        if self.api_version == 2:
+            last_updated_data = requests.get(ENDPOINTS_BY_API_VERSION[self.api_version] + "?UPDATE=1").json()
+            last_full_builtwith_scan = _convert_string_to_date(last_updated_data['FULL'])
+
         params = {
             'KEY': self.key,
             'LOOKUP': domain,
         }
+
         response = requests.get(ENDPOINTS_BY_API_VERSION[self.api_version],
                                 params=params)
 
-        return BuiltWithDomainInfo(response.json()) if self.api_version == 2 else response.json()
+        return BuiltWithDomainInfo(response.json(), last_full_builtwith_scan) if self.api_version == 2 else response.json()
